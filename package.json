@@ -20,6 +20,7 @@
     "client",
     "cordis.patch.yml",
     "README.md",
+    "README.zh-CN.md",
     "SDD.zh-CN.md"
   ],
   "dsh": {
