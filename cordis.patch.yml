@@ -1,0 +1,4 @@
+# Host-plane plugin row contributed by dsh-plugin-automations.
+- insert:
+    - id: scheduled-tasks
+      name: 'dsh-plugin-automations'
