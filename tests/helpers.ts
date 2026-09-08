@@ -40,10 +40,9 @@ export function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
   return {
     id: '6c7543c8-42ad-44ea-999f-5b00b5da9c5f',
     prompt: 'check tests',
+    schedule: { type: 'once', scheduledAt: '2026-08-15T00:00:00.000Z' },
     scheduledAt: '2026-08-15T00:00:00.000Z',
-    timeZone: 'Asia/Shanghai',
     mode: 'on_time',
-    repeat: 'once',
     state: 'pending',
     createdAt: '2026-08-14T00:00:00.000Z',
     ...overrides,

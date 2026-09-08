@@ -5,8 +5,16 @@ import { UserMessage } from "@deepseek-ai/dsh-llm";
 
 //#region src/types.d.ts
 type ExecutionMode = 'on_time' | 'when_idle';
-/** 重复方式：仅执行一次，或每天在同一本地时刻重复执行。 */
-type RepeatMode = 'once' | 'daily';
+interface OnceSchedule {
+  type: 'once';
+  scheduledAt: string;
+}
+interface CronSchedule {
+  type: 'cron';
+  expression: string;
+}
+/** A one-shot instant or a standard six-field local cron expression. */
+type TaskSchedule = OnceSchedule | CronSchedule;
 type TaskState = 'pending' | 'waiting_idle' | 'running' | 'completed' | 'failed';
 interface TaskError {
   code: string;
@@ -15,14 +23,11 @@ interface TaskError {
 interface ScheduledTask {
   id: string;
   prompt: string;
+  schedule: TaskSchedule;
+  /** Current occurrence instant; for cron this is the next occurrence. */
   scheduledAt: string;
-  timeZone: string;
   mode: ExecutionMode;
-  /**
-   * 重复方式。存储中可选以保证旧记录（v0.1.0 无此字段）可继续加载；
-   * 缺失等价于 'once'。新建任务与 API 响应中始终为显式值。
-   */
-  repeat?: RepeatMode;
+  sessionTitleTemplate?: string;
   state: TaskState;
   sessionId?: string;
   createdAt: string;
@@ -32,10 +37,12 @@ interface ScheduledTask {
 }
 interface CreateTaskInput {
   prompt: string;
-  scheduledAt: string;
-  timeZone: string;
+  schedule: TaskSchedule;
   mode: ExecutionMode;
-  repeat: RepeatMode;
+  sessionTitleTemplate?: string;
+}
+interface TaskMutationLock {
+  run<T>(operation: () => Promise<T> | T): Promise<T>;
 }
 interface TaskTable {
   get(id: string): ScheduledTask | undefined;
@@ -62,10 +69,10 @@ declare const MAX_TIMER_DELAY_MS = 2147483647;
 declare const scheduledTaskSchema: z.ZodObject<{
   id: z.ZodString;
   prompt: z.ZodString;
+  schedule: z.ZodType<TaskSchedule, unknown, z.core.$ZodTypeInternals<TaskSchedule, unknown>>;
   scheduledAt: z.ZodString;
-  timeZone: z.ZodString;
   mode: z.ZodUnion<readonly [z.ZodLiteral<"on_time">, z.ZodLiteral<"when_idle">]>;
-  repeat: z.ZodOptional<z.ZodUnion<readonly [z.ZodLiteral<"once">, z.ZodLiteral<"daily">]>>;
+  sessionTitleTemplate: z.ZodOptional<z.ZodString>;
   state: z.ZodUnion<readonly [z.ZodLiteral<"pending">, z.ZodLiteral<"waiting_idle">, z.ZodLiteral<"running">, z.ZodLiteral<"completed">, z.ZodLiteral<"failed">]>;
   sessionId: z.ZodOptional<z.ZodString>;
   createdAt: z.ZodString;
@@ -75,7 +82,7 @@ declare const scheduledTaskSchema: z.ZodObject<{
 }, z.core.$strict>;
 declare const scheduledTasksDomainSpec: {
   readonly name: "scheduled_tasks";
-  readonly version: 1;
+  readonly version: 2;
   readonly tables: {
     readonly tasks: {
       readonly valueSchema: z.ZodType<ScheduledTask>;
@@ -87,21 +94,26 @@ declare class RequestError extends Error {
   readonly status: number;
   constructor(code: string, message: string, status?: number);
 }
-declare function isValidTimeZone(timeZone: string): boolean;
-declare function parseCreateTaskInput(raw: unknown, now?: number): CreateTaskInput;
-declare function createScheduledTask(input: CreateTaskInput, now?: number): ScheduledTask;
+/** Return the next strict match using the host process's local timezone. */
+declare function nextCronAfter(expression: string, after?: number): string;
+declare function parseCreateTaskInput(raw: unknown, now?: number): CreateTaskInput & {
+  scheduledAt: string;
+};
+declare function createScheduledTask(input: CreateTaskInput & {
+  scheduledAt?: string;
+}, now?: number): ScheduledTask;
+declare function canonicalTaskContent(input: Pick<ScheduledTask, 'prompt' | 'schedule' | 'mode' | 'sessionTitleTemplate'>): string;
+declare function findActiveTask(table: TaskTable, input: Pick<ScheduledTask, 'prompt' | 'schedule' | 'mode' | 'sessionTitleTemplate'>): ScheduledTask | undefined;
+declare function createTaskIdempotent(table: TaskTable, raw: unknown, lock: TaskMutationLock, beforeCreate?: () => Promise<void>, now?: number): Promise<{
+  task: ScheduledTask;
+  created: boolean;
+}>;
 declare function listTasks(table: TaskTable): ScheduledTask[];
 declare function recoverInterruptedTasks(table: TaskTable, now?: number): Promise<number>;
-/**
- * 把 RFC 3339 instant 按 `timeZone` 的本地钟面时间平移 `days` 天，
- * 返回平移后的 UTC instant。用于每天重复任务：保持同一本地时刻，
- * 并且跨夏令时切换时仍落在正确的本地钟面时刻。
- */
-declare function addLocalDays(instantIso: string, timeZone: string, days: number): string;
 //#endregion
 //#region src/http.d.ts
 declare const API_PATH = "/dsh-scheduled-tasks/api/v1/tasks";
-declare function createTaskHttpHandler(table: TaskTable, onCreated: () => void): (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+declare function createTaskHttpHandler(table: TaskTable, onCreated: () => void, lock?: TaskMutationLock, beforeCreate?: () => Promise<void>): (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 //#endregion
 //#region src/runner.d.ts
 interface RunnerSession {
@@ -170,6 +182,7 @@ interface SchedulerOptions {
   executor: ScheduledTaskExecutor;
   logger?: SchedulerLogger;
   now?: () => number;
+  lock?: TaskMutationLock;
 }
 /**
  * One serialized wall-clock pump. Persistent task state is authoritative;
@@ -180,8 +193,9 @@ interface SchedulerOptions {
  * - `when_idle`（空闲执行）：只在北京时间谷时段（09:00-12:00、14:00-18:00
  *   高峰之外）认领；高峰时段内保持 `waiting_idle`，并在下一个谷时段开始时
  *   被定时器唤醒。
- * - `repeat: 'daily'`（每天执行）：任务进入终态（completed/failed）后，
- *   自动把 scheduledAt 平移到下一自然日的同一本地时刻并重置为 pending。
+ * - `cron`（Cron 周期）：任务进入终态（completed/failed）后，按表达式计算
+ *   下一次 occurrence 并重置为 pending。失败的 occurrence 不会自动重试；
+ *   它只会推进到下一次 Cron occurrence。
  */
 declare class TaskScheduler {
   private readonly table;
@@ -189,6 +203,7 @@ declare class TaskScheduler {
   private readonly executor;
   private readonly logger;
   private readonly now;
+  private readonly lock;
   private disposed;
   private rerun;
   private pumping;
@@ -201,13 +216,26 @@ declare class TaskScheduler {
   dispose(): void;
   private runPumps;
   private pumpOnce;
-  /**
-   * 每天重复任务进入终态后，把 scheduledAt 平移到下一自然日的同一本地时刻，
-   * 清空本次执行痕迹并重置为 pending，等待下一次到期。
-   */
-  private rollDailyOccurrences;
+  /** Advance terminal cron records; callers must hold the mutation lock. */
+  rollCronOccurrences(): Promise<void>;
   private scheduleIn;
   private clearTimer;
+}
+//#endregion
+//#region src/template.d.ts
+declare class TaskTemplateError extends Error {
+  constructor(message: string);
+}
+/** Validate a template at task creation time without needing an occurrence. */
+declare function validateTaskTemplate(template: string | undefined): void;
+/** Expand a validated task title template for one claimed occurrence. */
+declare function renderTaskTitle(task: ScheduledTask): string | undefined;
+//#endregion
+//#region src/mutex.d.ts
+/** Serializes async task mutations without holding a lock across processes. */
+declare class AsyncTaskMutationLock implements TaskMutationLock {
+  private tail;
+  run<T>(operation: () => Promise<T> | T): Promise<T>;
 }
 //#endregion
 //#region src/valley.d.ts
@@ -253,7 +281,13 @@ declare function nextValleyStart(now: number): number;
 //#region src/index.d.ts
 declare const name = "scheduled-tasks";
 declare const inject: string[];
+interface ScheduledTasksService {
+  create(input: CreateTaskInput): Promise<{
+    task: ScheduledTask;
+    created: boolean;
+  }>;
+}
 declare function apply(ctx: Context): Promise<void>;
 //#endregion
-export { API_PATH, AgentRegistryView, AgentView, CreateTaskInput, DEFAULT_EXECUTION_TIMEOUT_MS, ExecutionMode, MAX_ERROR_MESSAGE_BYTES, MAX_PROMPT_BYTES, MAX_TIMER_DELAY_MS, PEAK_WINDOWS, RepeatMode, RequestError, ScheduledTask, TaskError, TaskRunner, TaskScheduler, TaskState, TaskTable, TimerPort, VALLEY_TIME_ZONE, addLocalDays, apply, beijingParts, createScheduledTask, createTaskHttpHandler, inject, isPeakHour, isValidTimeZone, isValleyHour, listTasks, name, nextValleyStart, parseCreateTaskInput, recoverInterruptedTasks, renderTaskPrompt, scheduledTaskSchema, scheduledTasksDomainSpec };
+export { API_PATH, AgentRegistryView, AgentView, AsyncTaskMutationLock, CreateTaskInput, CronSchedule, DEFAULT_EXECUTION_TIMEOUT_MS, ExecutionMode, MAX_ERROR_MESSAGE_BYTES, MAX_PROMPT_BYTES, MAX_TIMER_DELAY_MS, OnceSchedule, PEAK_WINDOWS, RequestError, ScheduledTask, ScheduledTasksService, TaskError, TaskMutationLock, TaskRunner, TaskSchedule, TaskScheduler, TaskState, TaskTable, TaskTemplateError, TimerPort, VALLEY_TIME_ZONE, apply, beijingParts, canonicalTaskContent, createScheduledTask, createTaskHttpHandler, createTaskIdempotent, findActiveTask, inject, isPeakHour, isValleyHour, listTasks, name, nextCronAfter, nextValleyStart, parseCreateTaskInput, recoverInterruptedTasks, renderTaskPrompt, renderTaskTitle, scheduledTaskSchema, scheduledTasksDomainSpec, validateTaskTemplate };
 //# sourceMappingURL=index.d.ts.map

@@ -1,39 +1,43 @@
 import { describe, expect, it } from 'vitest'
-import { addLocalDays, listTasks, parseCreateTaskInput, RequestError } from '../src/domain.js'
+import {
+  canonicalTaskContent,
+  createScheduledTask,
+  createTaskIdempotent,
+  findActiveTask,
+  nextCronAfter,
+  parseCreateTaskInput,
+  RequestError,
+} from '../src/domain.js'
+import { AsyncTaskMutationLock } from '../src/mutex.js'
+import { renderTaskTitle } from '../src/template.js'
 import { MemoryTaskTable, task } from './helpers.js'
 
 const NOW = Date.parse('2026-08-14T12:00:00.000Z')
 
-function valid() {
-  return {
-    prompt: ' run tests ',
-    scheduledAt: '2026-08-15T01:00:00+08:00',
-    timeZone: 'Asia/Shanghai',
-    mode: 'when_idle',
-    repeat: 'daily',
-  }
-}
-
-describe('create task validation', () => {
-  it('normalizes a future RFC 3339 instant and trims the prompt', () => {
-    expect(parseCreateTaskInput(valid(), NOW)).toEqual({
+describe('task creation contract', () => {
+  it('normalizes a future once schedule', () => {
+    expect(parseCreateTaskInput({
+      prompt: ' run tests ',
+      schedule: { type: 'once', scheduledAt: '2026-08-15T01:00:00+08:00' },
+      mode: 'on_time',
+    }, NOW)).toEqual({
       prompt: 'run tests',
+      schedule: { type: 'once', scheduledAt: '2026-08-14T17:00:00.000Z' },
       scheduledAt: '2026-08-14T17:00:00.000Z',
-      timeZone: 'Asia/Shanghai',
-      mode: 'when_idle',
-      repeat: 'daily',
+      mode: 'on_time',
     })
   })
 
+  it('computes the first cron occurrence in the local timezone', () => {
+    expect(nextCronAfter('0 0 8 * * *', NOW)).toBe('2026-08-15T00:00:00.000Z')
+  })
+
   it.each([
-    [{ ...valid(), prompt: '  ' }, 'invalid_prompt'],
-    [{ ...valid(), scheduledAt: '2026-08-14T12:00:00Z' }, 'not_future'],
-    [{ ...valid(), scheduledAt: '2026-08-15 01:00' }, 'invalid_scheduled_at'],
-    [{ ...valid(), timeZone: 'CST' }, 'invalid_time_zone'],
-    [{ ...valid(), mode: 'later' }, 'invalid_mode'],
-    [{ ...valid(), repeat: 'weekly' }, 'invalid_repeat'],
-    [{ ...valid(), extra: true }, 'invalid_request'],
-    [{ ...valid(), repeat: undefined }, 'invalid_repeat'],
+    [{ prompt: 'x', schedule: { type: 'once', scheduledAt: '2026-08-14T11:00:00Z' }, mode: 'on_time' }, 'not_future'],
+    [{ prompt: 'x', schedule: { type: 'cron', expression: '0 8 * * *' }, mode: 'on_time' }, 'invalid_cron'],
+    [{ prompt: 'x', schedule: { type: 'cron', expression: '0 0 8 * * 8' }, mode: 'on_time' }, 'invalid_cron'],
+    [{ prompt: 'x', schedule: { type: 'once', scheduledAt: '2026-08-15T01:00:00Z' }, mode: 'later' }, 'invalid_mode'],
+    [{ prompt: 'x', schedule: { type: 'once', scheduledAt: '2026-08-15T01:00:00Z' }, mode: 'on_time', extra: true }, 'invalid_request'],
   ])('rejects invalid input %#', (input, code) => {
     try {
       parseCreateTaskInput(input, NOW)
@@ -44,42 +48,52 @@ describe('create task validation', () => {
     }
   })
 
-  it('enforces the prompt byte limit rather than a code-unit limit', () => {
-    expect(() => parseCreateTaskInput({ ...valid(), prompt: '界'.repeat(22_000) }, NOW))
-      .toThrowError(/64 KiB/)
+  it('rejects terminal-only and unknown title template fields', () => {
+    for (const template of ['Daily Feed · {{finishedAt}}', '{{unknown}}']) {
+      expect(() => parseCreateTaskInput({
+        prompt: 'x', schedule: { type: 'cron', expression: '0 0 8 * * *' }, mode: 'on_time', sessionTitleTemplate: template,
+      }, NOW)).toThrowError(RequestError)
+    }
+  })
+
+  it('renders the claimed occurrence title with task fields and requested precision', () => {
+    const scheduled = createScheduledTask(parseCreateTaskInput({
+      prompt: 'x', schedule: { type: 'cron', expression: '0 0 8 * * *' }, mode: 'on_time',
+      sessionTitleTemplate: 'Daily Feed · {{scheduledAt:YYYY-MM-DD}} · {{mode}} · {{sessionId}}',
+    }, NOW), NOW)
+    const claimed = {
+      ...scheduled,
+      state: 'running' as const,
+      sessionId: 'session-1',
+      startedAt: '2026-08-15T00:00:00.000Z',
+    }
+    expect(renderTaskTitle(claimed)).toBe('Daily Feed · 2026-08-15 · on_time · session-1')
   })
 })
 
-describe('daily occurrence rollover', () => {
-  it('keeps the same local wall-clock time on the next day', () => {
-    // 2026-08-15 09:30 Asia/Shanghai = 2026-08-15T01:30:00Z
-    const next = addLocalDays('2026-08-15T01:30:00.000Z', 'Asia/Shanghai', 1)
-    expect(next).toBe('2026-08-16T01:30:00.000Z')
+describe('content-idempotent creation', () => {
+  it('reuses an active task but ignores terminal records', async () => {
+    const active = createScheduledTask(parseCreateTaskInput({
+      prompt: 'x', schedule: { type: 'cron', expression: '0 0 8 * * *' }, mode: 'on_time',
+    }, NOW), NOW)
+    const terminal = task({ id: '5cf516f4-d771-48c0-8be7-c58334136189', state: 'completed', schedule: { type: 'once', scheduledAt: '2026-08-15T00:00:00.000Z' }, scheduledAt: '2026-08-15T00:00:00.000Z' })
+    const table = new MemoryTaskTable([active, terminal])
+    expect(findActiveTask(table, active)).toBe(active)
+    expect(findActiveTask(table, terminal)).toBeUndefined()
+    const comparable = {
+      prompt: active.prompt, schedule: active.schedule, mode: active.mode,
+      ...(active.sessionTitleTemplate === undefined ? {} : { sessionTitleTemplate: active.sessionTitleTemplate }),
+    }
+    expect(canonicalTaskContent(active)).toBe(canonicalTaskContent(comparable))
   })
 
-  it('crosses a month boundary', () => {
-    // 2026-08-31 23:00 Asia/Shanghai = 2026-08-31T15:00:00Z
-    const next = addLocalDays('2026-08-31T15:00:00.000Z', 'Asia/Shanghai', 1)
-    expect(next).toBe('2026-09-01T15:00:00.000Z')
-  })
-
-  it('preserves wall-clock time across the spring-forward DST transition', () => {
-    // 2026-03-07 10:00 America/New_York (EST, UTC-5) -> 2026-03-08 10:00 EDT (UTC-4)
-    const next = addLocalDays('2026-03-07T15:00:00.000Z', 'America/New_York', 1)
-    expect(next).toBe('2026-03-08T14:00:00.000Z')
-  })
-
-  it('preserves wall-clock time across the fall-back DST transition', () => {
-    // 2026-10-31 10:00 America/New_York (EDT, UTC-4) -> 2026-11-01 10:00 EST (UTC-5)
-    const next = addLocalDays('2026-10-31T14:00:00.000Z', 'America/New_York', 1)
-    expect(next).toBe('2026-11-01T15:00:00.000Z')
-  })
-})
-
-describe('list normalization', () => {
-  it('fills repeat for records persisted before the field existed', () => {
-    const { repeat: _repeat, ...legacy } = task()
-    const table = new MemoryTaskTable([legacy])
-    expect(listTasks(table)[0]?.repeat).toBe('once')
+  it('serializes concurrent identical creations into one record', async () => {
+    const table = new MemoryTaskTable()
+    const lock = new AsyncTaskMutationLock()
+    const input = { prompt: 'x', schedule: { type: 'cron', expression: '0 0 8 * * *' }, mode: 'on_time' }
+    const results = await Promise.all(Array.from({ length: 12 }, () => createTaskIdempotent(table, input, lock, undefined, NOW)))
+    expect(new Set(results.map(result => result.task.id)).size).toBe(1)
+    expect(results.filter(result => result.created)).toHaveLength(1)
+    expect([...table.records]).toHaveLength(1)
   })
 })

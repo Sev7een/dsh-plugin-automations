@@ -1,7 +1,17 @@
 export type ExecutionMode = 'on_time' | 'when_idle'
 
-/** 重复方式：仅执行一次，或每天在同一本地时刻重复执行。 */
-export type RepeatMode = 'once' | 'daily'
+export interface OnceSchedule {
+  type: 'once'
+  scheduledAt: string
+}
+
+export interface CronSchedule {
+  type: 'cron'
+  expression: string
+}
+
+/** A one-shot instant or a standard six-field local cron expression. */
+export type TaskSchedule = OnceSchedule | CronSchedule
 
 export type TaskState =
   | 'pending'
@@ -18,14 +28,11 @@ export interface TaskError {
 export interface ScheduledTask {
   id: string
   prompt: string
+  schedule: TaskSchedule
+  /** Current occurrence instant; for cron this is the next occurrence. */
   scheduledAt: string
-  timeZone: string
   mode: ExecutionMode
-  /**
-   * 重复方式。存储中可选以保证旧记录（v0.1.0 无此字段）可继续加载；
-   * 缺失等价于 'once'。新建任务与 API 响应中始终为显式值。
-   */
-  repeat?: RepeatMode
+  sessionTitleTemplate?: string
   state: TaskState
   sessionId?: string
   createdAt: string
@@ -36,10 +43,13 @@ export interface ScheduledTask {
 
 export interface CreateTaskInput {
   prompt: string
-  scheduledAt: string
-  timeZone: string
+  schedule: TaskSchedule
   mode: ExecutionMode
-  repeat: RepeatMode
+  sessionTitleTemplate?: string
+}
+
+export interface TaskMutationLock {
+  run<T>(operation: () => Promise<T> | T): Promise<T>
 }
 
 export interface TaskTable {

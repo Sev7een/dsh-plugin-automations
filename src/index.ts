@@ -10,20 +10,25 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-storage-domain'
-import { recoverInterruptedTasks, scheduledTasksDomainSpec } from './domain.js'
+import { createTaskIdempotent, recoverInterruptedTasks, scheduledTasksDomainSpec } from './domain.js'
 import { API_PATH, createTaskHttpHandler } from './http.js'
 import { TaskRunner } from './runner.js'
 import type { RunnerSession } from './runner.js'
 import { TaskScheduler } from './scheduler.js'
 import type { ScheduledTask, TaskTable } from './types.js'
+import type { CreateTaskInput, TaskMutationLock } from './types.js'
+import { AsyncTaskMutationLock } from './mutex.js'
+import { renderTaskTitle } from './template.js'
 
 export * from './types.js'
 export {
   RequestError,
-  addLocalDays,
   createScheduledTask,
-  isValidTimeZone,
+  canonicalTaskContent,
+  createTaskIdempotent,
+  findActiveTask,
   listTasks,
+  nextCronAfter,
   parseCreateTaskInput,
   recoverInterruptedTasks,
   scheduledTasksDomainSpec,
@@ -32,6 +37,8 @@ export {
 export { API_PATH, createTaskHttpHandler } from './http.js'
 export { TaskRunner, renderTaskPrompt } from './runner.js'
 export { TaskScheduler } from './scheduler.js'
+export { renderTaskTitle, validateTaskTemplate, TaskTemplateError } from './template.js'
+export { AsyncTaskMutationLock } from './mutex.js'
 export {
   PEAK_WINDOWS,
   VALLEY_TIME_ZONE,
@@ -52,9 +59,14 @@ export const inject = [
   'webServer',
 ]
 
+export interface ScheduledTasksService {
+  create(input: CreateTaskInput): Promise<{ task: ScheduledTask; created: boolean }>
+}
+
 export async function apply(ctx: Context): Promise<void> {
   const domain = await ctx.storageDomain.open(scheduledTasksDomainSpec)
   const table = domain.table('tasks') as TaskTable
+  const lock: TaskMutationLock = new AsyncTaskMutationLock()
   const logger = {
     info: (message: string) => { ctx.logger.info(message) },
     warn: (message: string) => { ctx.logger.warn(message) },
@@ -73,17 +85,20 @@ export async function apply(ctx: Context): Promise<void> {
         const preset = await ctx.agentPresets.resolve()
         const defaultModel = ctx.get('agentDefaultModel')?.currentSelection()
         const workspaceRoot = ctx.get('sandboxPolicy')?.workspaceRoot ?? process.cwd()
-        const handle = await ctx.agents.create({
+        const createOptions = {
           sessionId: task.sessionId as SessionId,
           signal,
-          meta: { cwd: workspaceRoot, agentPreset: preset.id },
+          meta: { cwd: workspaceRoot, agentPreset: preset.id, origin: 'scheduled' },
+          initialTitle: renderTaskTitle(task),
           ...defaultModel === undefined ? {} : {
             agentOptions: { provider: defaultModel.provider, model: defaultModel.model },
           },
-          setup: async (agentCtx) => {
+          setup: async (agentCtx: Context) => {
             await ctx.agentPresets.mount(agentCtx, preset.id)
           },
-        })
+        }
+        // The optional property is supplied by the MindPalace DSH Agent-factory extension.
+        const handle = await ctx.agents.create(createOptions as Parameters<typeof ctx.agents.create>[0])
         return { agent: handle.agent, dispose: () => handle.dispose() }
       },
       flush: (session: RunnerSession) => ctx.sessions.flush(session as Session),
@@ -94,6 +109,7 @@ export async function apply(ctx: Context): Promise<void> {
     table,
     executor: runner,
     logger,
+    lock,
     timer: {
       timeout: (callback, delayMs) => ctx.timeout(callback, delayMs),
     },
@@ -109,8 +125,25 @@ export async function apply(ctx: Context): Promise<void> {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: API_PATH,
-    handler: createTaskHttpHandler(table, () => { scheduler.requestPump() }),
+    handler: createTaskHttpHandler(
+      table,
+      () => { scheduler.requestPump() },
+      lock,
+      () => scheduler.rollCronOccurrences(),
+    ),
   }), 'scheduled-tasks.route()')
+
+  ctx.provide('scheduledTasks', {
+    create: (input: CreateTaskInput) => createTaskIdempotent(
+      table,
+      input,
+      lock,
+      () => scheduler.rollCronOccurrences(),
+    ).then(result => {
+      scheduler.requestPump()
+      return result
+    }),
+  } satisfies ScheduledTasksService)
 
   scheduler.start()
 }

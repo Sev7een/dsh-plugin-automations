@@ -2,20 +2,18 @@
 
 # dsh-plugin-automations
 
-> 为 DeepSeek Harness Web Profile 提供定时任务：支持准点执行、只在 DeepSeek 谷时段执行的“空闲执行”，以及每天重复执行。
->
-> Scheduled tasks for the DeepSeek Harness Web Profile: run on time, run only during DeepSeek off-peak (valley) hours, or repeat daily.
+> Scheduled tasks for the DeepSeek Harness Web Profile: run once or on a standard six-field Cron schedule, either on time or during DeepSeek off-peak hours.
 
 ## Features
 
 - Settings-page form and task list with 5-second polling.
 - Two execution modes: **on time** and **when idle (valley hours)**.
-- Two repeat modes: **once** and **daily**.
+- Two schedule types: **once** and standard six-field **Cron** expressions. Cron is evaluated in the host's local timezone.
 - `when_idle` runs outside Beijing peak hours (`09:00-12:00` and `14:00-18:00`) and automatically defers to the next valley window.
-- Daily tasks keep the same local wall-clock time across month and daylight-saving transitions.
+- Optional Session title templates support all task fields and Moment-style datetime formats, for example `Daily Feed · {{scheduledAt:YYYY-MM-DD}}`.
 - Durable task state through `ctx.storageDomain`.
 - One serialized scheduler pump persists `running` before launching the runner.
-- Each run uses an isolated Session with the default Agent preset, model, and Host workspace root.
+- Each occurrence uses an ordinary isolated Session with the default Agent preset, model, and Host workspace root.
 - Fixed 30-minute execution timeout and explicit `host_interrupted` recovery.
 - Strict JSON API validation, request-size limits, same-origin checks, and a custom mutation header.
 - Automated messages use `{ kind: 'plugin', plugin: 'dsh-plugin-automations' }` and never impersonate direct human input.
@@ -79,19 +77,19 @@ dsh plugin --profile web remove dsh-plugin-automations
 | `on_time` | Creates an isolated DSH Session and starts as soon as the task is due. |
 | `when_idle` | Runs only outside Beijing peak hours; a task due during peak hours waits for the next valley window. |
 
-### Repeat modes
+### Schedule types
 
-| Repeat | Behavior |
+| Schedule | Behavior |
 | --- | --- |
 | `once` | Reaches a terminal state and does not run again. |
-| `daily` | Rolls to the same local wall-clock time on the next calendar day. |
+| `cron` | After each terminal occurrence, computes the next matching occurrence. A failed occurrence is not retried. |
 
 ## HTTP API
 
 - `POST /dsh-scheduled-tasks/api/v1/tasks`
   - `Content-Type: application/json`
   - `X-DSH-Scheduled-Tasks: 1`
-  - Body: `{ prompt, scheduledAt, timeZone, mode, repeat }`
+  - Body: `{ prompt, schedule, mode, sessionTitleTemplate? }`
 - `GET /dsh-scheduled-tasks/api/v1/tasks`
 
 ```bash
@@ -100,10 +98,9 @@ curl -X POST http://127.0.0.1:3080/dsh-scheduled-tasks/api/v1/tasks \
   -H 'X-DSH-Scheduled-Tasks: 1' \
   -d '{
     "prompt": "check project tests",
-    "scheduledAt": "2026-08-15T01:00:00+08:00",
-    "timeZone": "Asia/Shanghai",
-    "mode": "when_idle",
-    "repeat": "daily"
+    "schedule": { "type": "cron", "expression": "0 0 8 * * *" },
+    "mode": "on_time",
+    "sessionTitleTemplate": "Daily Feed · {{scheduledAt:YYYY-MM-DD}}"
   }'
 ```
 

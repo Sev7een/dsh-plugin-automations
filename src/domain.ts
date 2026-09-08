@@ -1,19 +1,18 @@
 import { randomUUID } from 'node:crypto'
+import { CronExpressionParser } from 'cron-parser'
 import { z } from 'zod'
 import type { DomainSpec } from '@deepseek-ai/dsh-storage-domain'
-import type { CreateTaskInput, ScheduledTask, TaskError, TaskTable } from './types.js'
+import type { CreateTaskInput, ScheduledTask, TaskError, TaskTable, TaskSchedule, TaskMutationLock } from './types.js'
 import { MAX_ERROR_MESSAGE_BYTES, MAX_PROMPT_BYTES } from './types.js'
+import { validateTaskTemplate, TaskTemplateError } from './template.js'
 
 const rfc3339Instant = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
-
 const executionModeSchema = z.union([z.literal('on_time'), z.literal('when_idle')])
-const repeatModeSchema = z.union([z.literal('once'), z.literal('daily')])
+const onceScheduleSchema = z.object({ type: z.literal('once'), scheduledAt: z.string().regex(rfc3339Instant) }).strict()
+const cronScheduleSchema = z.object({ type: z.literal('cron'), expression: z.string().min(1).max(512) }).strict()
+const taskScheduleSchema: z.ZodType<TaskSchedule> = z.union([onceScheduleSchema, cronScheduleSchema])
 const taskStateSchema = z.union([
-  z.literal('pending'),
-  z.literal('waiting_idle'),
-  z.literal('running'),
-  z.literal('completed'),
-  z.literal('failed'),
+  z.literal('pending'), z.literal('waiting_idle'), z.literal('running'), z.literal('completed'), z.literal('failed'),
 ])
 
 export const taskErrorSchema: z.ZodType<TaskError> = z.object({
@@ -24,11 +23,10 @@ export const taskErrorSchema: z.ZodType<TaskError> = z.object({
 export const scheduledTaskSchema = z.object({
   id: z.string().uuid(),
   prompt: z.string().min(1).refine(value => Buffer.byteLength(value, 'utf8') <= MAX_PROMPT_BYTES),
+  schedule: taskScheduleSchema,
   scheduledAt: z.string().regex(rfc3339Instant),
-  timeZone: z.string().min(1).max(255),
   mode: executionModeSchema,
-  // Optional so records persisted before the repeat field existed still load.
-  repeat: repeatModeSchema.optional(),
+  sessionTitleTemplate: z.string().min(1).optional(),
   state: taskStateSchema,
   sessionId: z.string().min(1).optional(),
   createdAt: z.string().regex(rfc3339Instant),
@@ -38,21 +36,15 @@ export const scheduledTaskSchema = z.object({
 }).strict()
 
 export const scheduledTasksDomainSpec = {
-  // Current DSH storage units accept SQL-safe identifiers only. This is the
-  // runtime spelling of the SDD's logical `scheduled-tasks` domain.
   name: 'scheduled_tasks',
-  version: 1,
+  version: 2,
   tables: {
     tasks: { valueSchema: scheduledTaskSchema as unknown as z.ZodType<ScheduledTask> },
   },
 } as const satisfies DomainSpec
 
 export class RequestError extends Error {
-  constructor(
-    readonly code: string,
-    message: string,
-    readonly status = 400,
-  ) {
+  constructor(readonly code: string, message: string, readonly status = 400) {
     super(message)
     this.name = 'RequestError'
   }
@@ -65,70 +57,111 @@ function requireObject(raw: unknown): Record<string, unknown> {
   return raw as Record<string, unknown>
 }
 
-function validateExactKeys(value: Record<string, unknown>): void {
-  const expected = ['mode', 'prompt', 'repeat', 'scheduledAt', 'timeZone']
+function exactKeys(value: Record<string, unknown>, expected: readonly string[], message = 'Request body contains missing or unsupported fields.'): void {
   const keys = Object.keys(value).sort()
-  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
-    throw new RequestError('invalid_request', 'Request body contains missing or unsupported fields.')
+  const sorted = [...expected].sort()
+  if (keys.length !== sorted.length || keys.some((key, index) => key !== sorted[index])) {
+    throw new RequestError('invalid_request', message)
   }
 }
 
-export function isValidTimeZone(timeZone: string): boolean {
-  if (timeZone !== 'UTC' && !timeZone.includes('/')) return false
+function allowedKeys(value: Record<string, unknown>, expected: readonly string[]): void {
+  const allowed = new Set(expected)
+  if (Object.keys(value).some(key => !allowed.has(key))) {
+    throw new RequestError('invalid_request', 'Request body contains unsupported fields.')
+  }
+}
+
+function parseCronExpression(expression: string, code = 'invalid_cron'): string {
+  const fields = expression.trim().split(/\s+/)
+  if (fields.length !== 6) throw new RequestError(code, 'cron expression must contain six fields: second minute hour day-of-month month day-of-week.')
   try {
-    new Intl.DateTimeFormat('en-US', { timeZone }).format(0)
-    return true
-  } catch {
-    return false
+    CronExpressionParser.parse(expression, { currentDate: new Date() }).next()
+  } catch (error) {
+    throw new RequestError(code, `Invalid cron expression: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  return expression.trim()
+}
+
+/** Return the next strict match using the host process's local timezone. */
+export function nextCronAfter(expression: string, after = Date.now()): string {
+  const normalized = parseCronExpression(expression)
+  try {
+    const next = CronExpressionParser.parse(normalized, { currentDate: new Date(after) }).next().toDate()
+    if (!Number.isFinite(next.getTime())) throw new Error('cron parser returned an invalid occurrence')
+    return next.toISOString()
+  } catch (error) {
+    throw new RequestError('invalid_cron', `Invalid cron expression: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
-export function parseCreateTaskInput(raw: unknown, now = Date.now()): CreateTaskInput {
+function parseSchedule(raw: unknown, now: number): { schedule: TaskSchedule; scheduledAt: string } {
   const value = requireObject(raw)
-  validateExactKeys(value)
-
-  if (typeof value.prompt !== 'string') {
-    throw new RequestError('invalid_prompt', 'prompt must be a string.')
+  if (value.type === 'once') {
+    exactKeys(value, ['type', 'scheduledAt'])
+    if (typeof value.scheduledAt !== 'string' || !rfc3339Instant.test(value.scheduledAt)) {
+      throw new RequestError('invalid_scheduled_at', 'schedule.scheduledAt must be an RFC 3339 instant with an offset.')
+    }
+    const epoch = Date.parse(value.scheduledAt)
+    if (!Number.isFinite(epoch)) throw new RequestError('invalid_scheduled_at', 'schedule.scheduledAt is not a valid instant.')
+    if (epoch <= now) throw new RequestError('not_future', 'schedule.scheduledAt must be later than the current time.')
+    const scheduledAt = new Date(epoch).toISOString()
+    return { schedule: { type: 'once', scheduledAt }, scheduledAt }
   }
+  if (value.type === 'cron') {
+    exactKeys(value, ['type', 'expression'])
+    if (typeof value.expression !== 'string' || value.expression.trim() === '') {
+      throw new RequestError('invalid_cron', 'schedule.expression must be a non-empty string.')
+    }
+    const expression = parseCronExpression(value.expression)
+    return { schedule: { type: 'cron', expression }, scheduledAt: nextCronAfter(expression, now) }
+  }
+  throw new RequestError('invalid_schedule', 'schedule must be a once or cron object.')
+}
+
+export function parseCreateTaskInput(raw: unknown, now = Date.now()): CreateTaskInput & { scheduledAt: string } {
+  const value = requireObject(raw)
+  allowedKeys(value, ['mode', 'prompt', 'schedule', 'sessionTitleTemplate'])
+  if (typeof value.prompt !== 'string') throw new RequestError('invalid_prompt', 'prompt must be a string.')
   const prompt = value.prompt.trim()
   if (prompt.length === 0) throw new RequestError('invalid_prompt', 'prompt must not be empty.')
-  if (Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) {
-    throw new RequestError('prompt_too_large', 'prompt must not exceed 64 KiB.')
-  }
+  if (Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) throw new RequestError('prompt_too_large', 'prompt must not exceed 64 KiB.')
+  if (value.mode !== 'on_time' && value.mode !== 'when_idle') throw new RequestError('invalid_mode', 'mode must be on_time or when_idle.')
 
-  if (typeof value.scheduledAt !== 'string' || !rfc3339Instant.test(value.scheduledAt)) {
-    throw new RequestError('invalid_scheduled_at', 'scheduledAt must be an RFC 3339 instant with an offset.')
+  let sessionTitleTemplate: string | undefined
+  if (value.sessionTitleTemplate !== undefined) {
+    if (typeof value.sessionTitleTemplate !== 'string' || value.sessionTitleTemplate.trim() === '') {
+      throw new RequestError('invalid_title_template', 'sessionTitleTemplate must be a non-empty string when provided.')
+    }
+    sessionTitleTemplate = value.sessionTitleTemplate
+    try {
+      validateTaskTemplate(sessionTitleTemplate)
+    } catch (error) {
+      if (error instanceof TaskTemplateError) throw new RequestError('invalid_title_template', error.message)
+      throw error
+    }
   }
-  const epoch = Date.parse(value.scheduledAt)
-  if (!Number.isFinite(epoch)) {
-    throw new RequestError('invalid_scheduled_at', 'scheduledAt is not a valid instant.')
-  }
-  if (epoch <= now) throw new RequestError('not_future', 'scheduledAt must be later than the current time.')
-
-  if (typeof value.timeZone !== 'string' || !isValidTimeZone(value.timeZone)) {
-    throw new RequestError('invalid_time_zone', 'timeZone must be UTC or a valid IANA Area/Location name.')
-  }
-  if (value.mode !== 'on_time' && value.mode !== 'when_idle') {
-    throw new RequestError('invalid_mode', 'mode must be on_time or when_idle.')
-  }
-  if (value.repeat !== 'once' && value.repeat !== 'daily') {
-    throw new RequestError('invalid_repeat', 'repeat must be once or daily.')
-  }
-
+  const parsed = parseSchedule(value.schedule, now)
   return {
     prompt,
-    scheduledAt: new Date(epoch).toISOString(),
-    timeZone: value.timeZone,
+    schedule: parsed.schedule,
+    scheduledAt: parsed.scheduledAt,
     mode: value.mode,
-    repeat: value.repeat,
+    ...(sessionTitleTemplate === undefined ? {} : { sessionTitleTemplate }),
   }
 }
 
-export function createScheduledTask(input: CreateTaskInput, now = Date.now()): ScheduledTask {
+export function createScheduledTask(input: CreateTaskInput & { scheduledAt?: string }, now = Date.now()): ScheduledTask {
+  const scheduledAt = input.scheduledAt ?? (input.schedule.type === 'once'
+    ? input.schedule.scheduledAt
+    : nextCronAfter(input.schedule.expression, now))
   const task: ScheduledTask = {
     id: randomUUID(),
-    ...input,
-    scheduledAt: new Date(Date.parse(input.scheduledAt)).toISOString(),
+    prompt: input.prompt,
+    schedule: input.schedule,
+    scheduledAt,
+    mode: input.mode,
+    ...(input.sessionTitleTemplate === undefined ? {} : { sessionTitleTemplate: input.sessionTitleTemplate }),
     state: 'pending',
     createdAt: new Date(now).toISOString(),
   }
@@ -136,13 +169,43 @@ export function createScheduledTask(input: CreateTaskInput, now = Date.now()): S
   return task
 }
 
+export function canonicalTaskContent(input: Pick<ScheduledTask, 'prompt' | 'schedule' | 'mode' | 'sessionTitleTemplate'>): string {
+  return JSON.stringify({
+    mode: input.mode,
+    prompt: input.prompt,
+    schedule: input.schedule,
+    sessionTitleTemplate: input.sessionTitleTemplate ?? null,
+  })
+}
+
+export function findActiveTask(table: TaskTable, input: Pick<ScheduledTask, 'prompt' | 'schedule' | 'mode' | 'sessionTitleTemplate'>): ScheduledTask | undefined {
+  const expected = canonicalTaskContent(input)
+  return [...table.entries()]
+    .map(([, task]) => task)
+    .filter(task => task.state === 'pending' || task.state === 'waiting_idle' || task.state === 'running')
+    .find(task => canonicalTaskContent(task) === expected)
+}
+
+export async function createTaskIdempotent(
+  table: TaskTable,
+  raw: unknown,
+  lock: TaskMutationLock,
+  beforeCreate?: () => Promise<void>,
+  now = Date.now(),
+): Promise<{ task: ScheduledTask; created: boolean }> {
+  const input = parseCreateTaskInput(raw, now)
+  return lock.run(async () => {
+    await beforeCreate?.()
+    const existing = findActiveTask(table, input)
+    if (existing !== undefined) return { task: existing, created: false }
+    const task = createScheduledTask(input, now)
+    await table.put(task.id, task)
+    return { task, created: true }
+  })
+}
+
 export function listTasks(table: TaskTable): ScheduledTask[] {
-  return [...table.entries()].map(([, task]) => ({
-    ...task,
-    // Records persisted before the repeat field existed read back without it;
-    // the API contract always exposes an explicit value.
-    repeat: task.repeat ?? 'once',
-  }))
+  return [...table.entries()].map(([, task]) => task)
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
 }
 
@@ -158,80 +221,19 @@ export function truncateUtf8(value: string, maxBytes: number): string {
 
 export function safeTaskError(code: string, error: unknown): TaskError {
   const raw = error instanceof Error ? error.message : String(error)
-  return {
-    code,
-    message: truncateUtf8(raw || 'The task failed.', MAX_ERROR_MESSAGE_BYTES),
-  }
+  return { code, message: truncateUtf8(raw || 'The task failed.', MAX_ERROR_MESSAGE_BYTES) }
 }
 
 export async function recoverInterruptedTasks(table: TaskTable, now = Date.now()): Promise<number> {
   const finishedAt = new Date(now).toISOString()
   const running = [...table.entries()].filter(([, task]) => task.state === 'running')
   for (const [id] of running) {
-    await table.update(id, (current) => current.state !== 'running' ? current : {
+    await table.update(id, current => current.state !== 'running' ? current : {
       ...current,
       state: 'failed',
       finishedAt,
-      error: {
-        code: 'host_interrupted',
-        message: 'The host stopped before the scheduled task reached a terminal state.',
-      },
+      error: { code: 'host_interrupted', message: 'The host stopped before the scheduled task reached a terminal state.' },
     })
   }
   return running.length
-}
-
-interface LocalParts {
-  year: number
-  month: number
-  day: number
-  hour: number
-  minute: number
-  second: number
-}
-
-function localParts(ms: number, timeZone: string): LocalParts {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hourCycle: 'h23',
-  }).formatToParts(new Date(ms))
-  const value = (type: string): number => {
-    const part = parts.find(candidate => candidate.type === type)
-    return part === undefined ? NaN : Number(part.value)
-  }
-  return {
-    year: value('year'),
-    month: value('month'),
-    day: value('day'),
-    hour: value('hour'),
-    minute: value('minute'),
-    second: value('second'),
-  }
-}
-
-/**
- * 把 RFC 3339 instant 按 `timeZone` 的本地钟面时间平移 `days` 天，
- * 返回平移后的 UTC instant。用于每天重复任务：保持同一本地时刻，
- * 并且跨夏令时切换时仍落在正确的本地钟面时刻。
- */
-export function addLocalDays(instantIso: string, timeZone: string, days: number): string {
-  const original = Date.parse(instantIso)
-  const parts = localParts(original, timeZone)
-  // 把“本地钟面时间”当作 UTC 求值，即可用纯算术处理日历进位。
-  const localAsUtc = (ms: number): number => {
-    const p = localParts(ms, timeZone)
-    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second)
-  }
-  const target = Date.UTC(parts.year, parts.month - 1, parts.day + days, parts.hour, parts.minute, parts.second)
-  // 先按原时刻的时区偏移估算，再按目标时刻附近的实际偏移修正（覆盖夏令时）。
-  let guess = target + (original - localAsUtc(original))
-  guess += target - localAsUtc(guess)
-  guess += target - localAsUtc(guess)
-  return new Date(guess).toISOString()
 }

@@ -5,7 +5,9 @@ import type {
   TimerPort,
 } from './types.js'
 import { MAX_TIMER_DELAY_MS } from './types.js'
-import { addLocalDays } from './domain.js'
+import { nextCronAfter } from './domain.js'
+import type { TaskMutationLock } from './types.js'
+import { AsyncTaskMutationLock } from './mutex.js'
 import { isPeakHour, nextValleyStart } from './valley.js'
 
 export interface ScheduledTaskExecutor {
@@ -23,6 +25,7 @@ export interface SchedulerOptions {
   executor: ScheduledTaskExecutor
   logger?: SchedulerLogger
   now?: () => number
+  lock?: TaskMutationLock
 }
 
 const noLogger: SchedulerLogger = { info() {}, warn() {} }
@@ -36,8 +39,9 @@ const noLogger: SchedulerLogger = { info() {}, warn() {} }
  * - `when_idle`（空闲执行）：只在北京时间谷时段（09:00-12:00、14:00-18:00
  *   高峰之外）认领；高峰时段内保持 `waiting_idle`，并在下一个谷时段开始时
  *   被定时器唤醒。
- * - `repeat: 'daily'`（每天执行）：任务进入终态（completed/failed）后，
- *   自动把 scheduledAt 平移到下一自然日的同一本地时刻并重置为 pending。
+ * - `cron`（Cron 周期）：任务进入终态（completed/failed）后，按表达式计算
+ *   下一次 occurrence 并重置为 pending。失败的 occurrence 不会自动重试；
+ *   它只会推进到下一次 Cron occurrence。
  */
 export class TaskScheduler {
   private readonly table: TaskTable
@@ -45,6 +49,7 @@ export class TaskScheduler {
   private readonly executor: ScheduledTaskExecutor
   private readonly logger: SchedulerLogger
   private readonly now: () => number
+  private readonly lock: TaskMutationLock
   private disposed = false
   private rerun = false
   private pumping: Promise<void> | undefined
@@ -56,6 +61,7 @@ export class TaskScheduler {
     this.executor = options.executor
     this.logger = options.logger ?? noLogger
     this.now = options.now ?? Date.now
+    this.lock = options.lock ?? new AsyncTaskMutationLock()
   }
 
   start(): void {
@@ -98,7 +104,7 @@ export class TaskScheduler {
   private async pumpOnce(): Promise<void> {
     this.clearTimer()
     const now = this.now()
-    await this.rollDailyOccurrences()
+    await this.lock.run(() => this.rollCronOccurrences())
     const candidates = [...this.table.entries()].map(([, task]) => task)
       .filter(task => task.state === 'pending' || task.state === 'waiting_idle')
       .sort((left, right) => left.scheduledAt.localeCompare(right.scheduledAt)
@@ -157,18 +163,15 @@ export class TaskScheduler {
     if (delay !== undefined) this.scheduleIn(delay)
   }
 
-  /**
-   * 每天重复任务进入终态后，把 scheduledAt 平移到下一自然日的同一本地时刻，
-   * 清空本次执行痕迹并重置为 pending，等待下一次到期。
-   */
-  private async rollDailyOccurrences(): Promise<void> {
+  /** Advance terminal cron records; callers must hold the mutation lock. */
+  async rollCronOccurrences(): Promise<void> {
     for (const [id, task] of this.table.entries()) {
       if (this.disposed) return
-      if (task.repeat !== 'daily') continue
+      if (task.schedule.type !== 'cron') continue
       if (task.state !== 'completed' && task.state !== 'failed') continue
-      const nextScheduledAt = addLocalDays(task.scheduledAt, task.timeZone, 1)
+      const nextScheduledAt = nextCronAfter(task.schedule.expression, Date.parse(task.scheduledAt))
       await this.table.update(id, current => {
-        if (current.repeat !== 'daily'
+        if (current.schedule.type !== 'cron'
           || (current.state !== 'completed' && current.state !== 'failed')) return current
         const { sessionId: _sessionId, startedAt: _startedAt, finishedAt: _finishedAt, error: _error, ...rest } = current
         return {
@@ -177,7 +180,7 @@ export class TaskScheduler {
           state: 'pending',
         }
       })
-      this.logger.info(`scheduled task ${id} rolled to next daily occurrence (${nextScheduledAt})`)
+      this.logger.info(`scheduled task ${id} rolled to next cron occurrence (${nextScheduledAt})`)
     }
   }
 

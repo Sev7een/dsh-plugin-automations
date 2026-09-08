@@ -1,7 +1,9 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { TaskTable } from './types.js'
+import type { TaskMutationLock } from './types.js'
 import { MAX_PROMPT_BYTES } from './types.js'
-import { createScheduledTask, listTasks, parseCreateTaskInput, RequestError } from './domain.js'
+import { createTaskIdempotent, listTasks, RequestError } from './domain.js'
+import { AsyncTaskMutationLock } from './mutex.js'
 
 export const API_PATH = '/dsh-scheduled-tasks/api/v1/tasks'
 // JSON may escape each saved byte as `\u00XX`; keep that worst case bounded
@@ -62,7 +64,12 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
   }
 }
 
-export function createTaskHttpHandler(table: TaskTable, onCreated: () => void) {
+export function createTaskHttpHandler(
+  table: TaskTable,
+  onCreated: () => void,
+  lock: TaskMutationLock = new AsyncTaskMutationLock(),
+  beforeCreate?: () => Promise<void>,
+) {
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     try {
       if (req.method === 'GET') {
@@ -80,11 +87,9 @@ export function createTaskHttpHandler(table: TaskTable, onCreated: () => void) {
       if (req.headers['x-dsh-scheduled-tasks'] !== '1') {
         throw new RequestError('missing_request_header', 'X-DSH-Scheduled-Tasks: 1 is required.', 403)
       }
-      const input = parseCreateTaskInput(await readJson(req))
-      const task = createScheduledTask(input)
-      await table.put(task.id, task)
+      const result = await createTaskIdempotent(table, await readJson(req), lock, beforeCreate)
       onCreated()
-      sendJson(res, 201, task)
+      sendJson(res, result.created ? 201 : 200, result.task)
     } catch (error) {
       if (error instanceof RequestError) {
         sendError(res, error.status, error.code, error.message)

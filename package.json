@@ -42,6 +42,8 @@
     "node": ">=20"
   },
   "dependencies": {
+    "cron-parser": "^5.10.0",
+    "moment": "^2.30.1",
     "zod": "^4.4.3"
   },
   "peerDependencies": {
@@ -68,8 +70,8 @@
     "@deepseek-ai/dsh-sandbox-policy": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-session": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-session-persistence": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-storage-domain": "^0.0.1-rc.1",
     "@deepseek-ai/dsh-storage": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-storage-domain": "^0.0.1-rc.1",
     "@deepseek-ai/dsh-timeout": "^0.1.0-rc.6",
     "@types/node": "^24.0.0",
     "tsdown": "^0.15.0",

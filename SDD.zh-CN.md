@@ -3,19 +3,19 @@
 | 项目 | 内容 |
 | --- | --- |
 | 插件名 | `dsh-plugin-automations` |
-| 文档版本 | 0.3 |
+| 文档版本 | 0.4 |
 | 状态 | MVP 设计稿 |
 | 目标宿主 | DeepSeek Harness Web Profile |
 
 ## 1. 目标
 
-插件只解决一个问题：用户提交一个定时任务，选择任务的执行方式与重复方式。
+插件只解决一个问题：用户提交一个定时任务，选择任务的执行方式与调度表达式。
 
 - **准点执行**：到达设定时间后立即提交给 DSH Agent，不等待任何窗口。
 - **空闲执行**：到达设定时间后进入等待；只在 DeepSeek 峰谷算力价格的谷时段
   （每日高峰时段为北京时间 `09:00 - 12:00`、`14:00 - 18:00`，其余时间为谷
   时段）执行命令，高峰时段内保持等待并在下一个谷时段开始时自动执行。
-- **每天执行**：任务完成后自动滚动到下一自然日的同一本地时刻，重复执行。
+- **Cron 调度**：使用标准六字段 Cron 表达式计算每个 occurrence；表达式按宿主进程本地时区执行。
 
 插件不实现复杂周期（RRULE）、长期目标、多轮自动推进、重试策略、Worktree、
 预算控制、通知、技能选择、模型选择或复杂权限配置。
@@ -29,9 +29,9 @@
 | 字段 | 类型 | 规则 |
 | --- | --- | --- |
 | 任务内容 | 多行文本 | 必填，去除首尾空白后不能为空，最大 64 KiB。 |
-| 执行时间 | 本地日期时间 | 必填，必须晚于当前时间。 |
+| 调度 | 一次性时间或 Cron 表达式 | 必填；一次性时间必须晚于当前时间，Cron 必须是标准六字段表达式。 |
 | 执行方式 | 单选 | `准点执行` 或 `空闲执行（谷时段）`，默认 `准点执行`。 |
-| 每天执行 | 复选框 | 可选；勾选后任务每天在同一本地时刻重复执行。 |
+| Session 标题模板 | 单行文本 | 可选；支持任务字段变量和 `{{scheduledAt:YYYY-MM-DD}}` 形式的日期格式。 |
 
 选中“空闲执行（谷时段）”时表单显示谷时段说明：仅在谷时段执行（北京时间
 `09:00-12:00`、`14:00-18:00` 高峰之外）。
@@ -43,9 +43,9 @@
 每项任务仅展示：
 
 - 任务内容摘要；
-- 计划时间（每天重复任务显示下次执行时间）；
+- 下次计划时间；
 - 执行方式；
-- 重复方式（仅一次 / 每天）；
+- 调度类型（仅一次 / Cron）；
 - 当前状态；
 - 实际开始时间和完成时间（存在时）；
 - 失败原因（存在时）。
@@ -58,7 +58,7 @@ Client 每 5 秒轮询一次列表，不引入 SSE 或 WebSocket。
 
 ### 3.1 准点执行
 
-当 `now >= scheduledAt` 时，Scheduler 立即认领任务并创建一个新的 DSH Session 执行任务。其他前台 Agent 是否正在运行不影响认领。
+当 `now >= scheduledAt` 时，Scheduler 立即认领任务并创建一个普通的独立 DSH Session 执行任务。其他前台 Agent 是否正在运行不影响认领。
 
 “准点”表示不主动等待空闲，不承诺操作系统级实时性。如果 DSH 未启动、主机休眠或进程阻塞，任务会在 DSH 恢复后尽快执行。
 
@@ -79,9 +79,9 @@ Client 每 5 秒轮询一次列表，不引入 SSE 或 WebSocket。
 ### 3.3 执行次数
 
 - 一次性任务：每个任务最多成功认领一次。完成或失败后不再次执行，不做自动重试。
-- 每天执行任务：任务进入终态（`已完成` / `失败`）后，Scheduler 自动把
-  `scheduledAt` 平移到下一自然日的同一本地时刻并重置为 `pending`，等待次日
-  再次执行；跨月、跨夏令时保持同一墙钟时间。失败的任务次日会再次尝试。
+- Cron 任务：任务进入终态（`已完成` / `失败`）后，Scheduler 按表达式计算下一次
+  `scheduledAt` 并重置为 `pending`。失败的 occurrence 不重试，只推进到下一次
+  Cron occurrence。
 
 ## 4. 总体架构
 
@@ -103,7 +103,7 @@ flowchart LR
 | --- | --- |
 | Task API | 创建任务、返回任务列表、验证输入。 |
 | Task Store | 持久化任务及执行状态。 |
-| Scheduler | 维护到期 timer 与谷时段边界 timer，判断准点或谷时段条件并认领任务，滚动每天重复任务。 |
+| Scheduler | 维护到期 timer 与谷时段边界 timer，判断准点或谷时段条件并认领任务，推进 Cron occurrence。 |
 | Task Runner | 创建 Agent、投递任务、等待结束、记录结果。 |
 | Web Client | 表单提交和定时轮询展示。 |
 
@@ -139,17 +139,19 @@ const handle = await ctx.agents.create({
 
 Runner 等待 `agent.whenIdle()`，再调用 `ctx.sessions.flush(agent.session)`。flush 成功后写入完成状态；模型、工具或持久化失败则写入失败状态。最后只释放本插件持有的 `AgentHandle`。
 
-### 5.2 为什么使用新 Session
+### 5.2 为什么使用普通独立 Session
 
-新 Session 不需要恢复用户可能已关闭的聊天，也不会把定时任务插入用户正在进行的上下文。任务完成后，Session transcript 仍由 DSH 原有持久化机制保存，任务记录只保存 Session id 和状态。
+每个 occurrence 使用普通的独立 Session，不恢复用户可能已关闭的聊天，也不会把定时任务插入用户正在进行的上下文。Session 标题在创建时直接写入；任务完成后，Session transcript 仍由 DSH 原有持久化机制保存，任务记录只保存 Session id 和状态。
 
 ## 6. 数据模型
 
-使用 `ctx.storageDomain` 创建 `scheduled-tasks` version `1`，其中只有一张 `tasks` 表。
+使用 `ctx.storageDomain` 创建 `scheduled-tasks` version `2`，其中只有一张 `tasks` 表。
 
 ```ts
 type ExecutionMode = 'on_time' | 'when_idle'
-type RepeatMode = 'once' | 'daily'
+type TaskSchedule =
+  | { type: 'once'; scheduledAt: string }
+  | { type: 'cron'; expression: string }
 
 type TaskState =
   | 'pending'
@@ -161,10 +163,10 @@ type TaskState =
 interface ScheduledTask {
   id: string
   prompt: string
+  schedule: TaskSchedule
   scheduledAt: string       // UTC RFC 3339
-  timeZone: string          // 创建时浏览器的 IANA 时区，用于展示与每天滚动
   mode: ExecutionMode
-  repeat?: RepeatMode        // 缺失等价于 'once'（兼容旧记录）；API 恒为显式值
+  sessionTitleTemplate?: string
   state: TaskState
   sessionId?: string
   createdAt: string
@@ -180,12 +182,13 @@ interface ScheduledTask {
 约束：
 
 - `id` 为 UUID。
-- `scheduledAt` 是唯一调度权威；Client 提交本地时间时同时提交 IANA 时区，Host 转换并校验 UTC instant。
+- `scheduledAt` 是当前 occurrence 的调度权威；Cron 表达式由标准 Cron 库解析，使用宿主本地时区，不在插件中复制解析器或调度器。
 - `prompt` 和错误文本有 byte 上限。
 - 状态变化先写入持久化存储，再更新 UI 可见结果。
 - 不在任务表复制 Session transcript、工具结果或凭证。
-- 每天重复任务的 `scheduledAt` 在进入终态后由 Scheduler 按 `timeZone`
-  平移到下一自然日同一本地时刻（跨夏令时保持墙钟时间），并清空本次执行痕迹。
+- Cron 任务的 `scheduledAt` 在进入终态后由 Scheduler 计算下一匹配时间，并清空本次执行痕迹。
+- `sessionTitleTemplate` 可引用所有非终态任务字段；日期格式写在变量中，例如
+  `{{scheduledAt:YYYY-MM-DD}}`。终态字段不能用于创建时的标题模板。
 
 ## 7. 状态机
 
@@ -198,20 +201,20 @@ stateDiagram-v2
   waiting_idle --> running: 进入谷时段
   running --> completed: Agent 与 Session flush 成功
   running --> failed: 创建/执行/持久化失败
-  completed --> pending: 每天重复任务滚动到次日同一时刻
-  failed --> pending: 每天重复任务滚动到次日同一时刻
+  completed --> pending: Cron 任务推进到下一次 occurrence
+  failed --> pending: Cron 任务推进到下一次 occurrence
 ```
 
-`completed` 和 `failed` 为单次执行的终态；`repeat: 'daily'` 的任务在终态后
-自动滚回 `pending`。
+`completed` 和 `failed` 是一个 occurrence 的终态；Cron 任务在终态后自动推进到
+下一次 occurrence。失败的 occurrence 不会自动重试。
 
 ## 8. Scheduler 算法
 
 Scheduler 使用单个串行 pump，避免两个回调同时认领同一任务。
 
 ```text
-1. 将处于终态（completed/failed）的每天重复任务滚动到下一自然日同一本地
-   时刻，重置为 pending 并清空本次执行痕迹。
+1. 将处于终态（completed/failed）的 Cron 任务推进到下一次匹配 occurrence，
+   重置为 pending 并清空本次执行痕迹。
 2. 读取全部 pending / waiting_idle 任务。
 3. 将已到期的 when_idle 任务更新为 waiting_idle。
 4. 对每个已到期任务：
@@ -233,7 +236,7 @@ Timer 不是状态权威。每次唤醒都重新读取 wall clock 和持久化�
 
 - `pending` 和 `waiting_idle` 任务重新进入 Scheduler。
 - 进程异常退出时遗留的 `running` 任务标记为 `failed`，错误码为
-  `host_interrupted`；每天重复任务随后滚动到次日同一时刻，不重复执行当天。
+  `host_interrupted`；Cron 任务随后推进到下一次匹配 occurrence，不重复执行当天。
 - 不自动重试 `host_interrupted` 的一次性任务。
 
 ## 9. HTTP API
@@ -251,14 +254,16 @@ X-DSH-Scheduled-Tasks: 1
 ```json
 {
   "prompt": "检查项目测试并给出结果",
-  "scheduledAt": "2026-08-15T01:00:00+08:00",
-  "timeZone": "Asia/Shanghai",
-  "mode": "when_idle",
-  "repeat": "daily"
+  "schedule": { "type": "cron", "expression": "0 0 8 * * *" },
+  "mode": "on_time",
+  "sessionTitleTemplate": "Daily Feed · {{scheduledAt:YYYY-MM-DD}}"
 }
 ```
 
-`repeat` 为 `once`（仅一次）或 `daily`（每天重复）。成功返回 `201` 和完整任务记录。
+`schedule.type` 为 `once` 或 `cron`。一次性调度需要未来的
+`schedule.scheduledAt`；Cron 调度需要标准六字段 `schedule.expression`。成功创建
+返回 `201`；与现有未完成任务的 prompt、schedule、mode 和标题模板完全相同的请求
+返回 `200` 并复用现有任务。终态任务不参与去重。
 
 ### 9.2 获取列表
 
@@ -330,12 +335,12 @@ dsh-automations/
 
 ### 13.1 单元测试
 
-- 未来时间、过去时间、无效时区、非法 mode/repeat 和空 prompt 校验。
+- 未来时间、非法 Cron、非法 mode 和空 prompt 校验。
 - 北京高峰/谷时段边界判定（09:00、12:00、14:00、18:00 等）与下一个谷时段开始时刻。
 - 准点任务到期后立即认领（含高峰时段）。
 - 空闲任务在北京高峰时段保持 `waiting_idle`，并设置下一个谷时段开始定时器。
 - 谷时段开始定时器触发后认领空闲任务。
-- 每天重复任务完成后滚动到下一自然日同一本地时刻并重置为 pending（含跨月与跨夏令时）。
+- Cron 任务完成或失败后推进到下一次匹配 occurrence 并重置为 pending；失败 occurrence 不重试。
 - 一次性任务保持终态，不滚动。
 - 串行 pump 不重复认领。
 - 重启后恢复 pending，遗留 running 变为 `host_interrupted`。
@@ -347,22 +352,21 @@ dsh-automations/
 1. Client POST 创建任务并能在 GET 列表中读取。
 2. 准点模式产生一个新 Session 和一个模型 turn。
 3. 空闲模式在北京高峰时段不产生 Session，谷时段开始后产生。
-4. Agent 完成且 Session flush 后任务变为 completed；每天重复任务随后滚动到次日。
+4. Agent 完成且 Session flush 后任务变为 completed；Cron 任务随后推进到下一次 occurrence。
 5. 插件 dispose 后 route、timer、listener 和插件拥有的 AgentHandle 全部释放。
 
 ## 14. 验收标准
 
-1. 用户只需填写任务内容、时间并选择“准点执行”或“空闲执行”，可选“每天执行”即可提交。
+1. 用户填写任务内容、一次性时间或六字段 Cron、执行方式和可选标题模板即可提交。
 2. 准点任务到期后不等待任何窗口。
 3. 空闲任务在北京高峰时段（09:00-12:00、14:00-18:00）不被认领，进入谷时段后自动执行。
 4. 每个任务每次到期只认领一次，宿主重启不会重复执行已完成/失败的单次任务。
-5. 每天重复任务自动滚动到次日同一本地时刻，跨月、跨夏令时保持墙钟时间。
+5. Cron 任务按标准表达式推进到下一次 occurrence；失败 occurrence 不自动重试。
 6. 任务状态跨宿主重启保存，遗留 running 任务明确标记为失败。
 7. 自动化消息不具有直接人类输入权限，也不扩大 DSH sandbox、工具或审批边界。
 
 ## 15. 明确不做
 
-- RRULE 等复杂周期（仅支持每天重复）；
 - 任务编辑、删除、暂停、取消和重试；
 - 多轮长期目标和闲时持续推进；
 - Worktree、并发配置、成本和 token 预算；

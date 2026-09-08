@@ -2,15 +2,15 @@
 
 # dsh-plugin-automations
 
-> 为 DeepSeek Harness Web Profile 提供定时任务：支持准点执行、只在 DeepSeek 谷时段执行的“空闲执行”，以及每天重复执行。
+> 为 DeepSeek Harness Web Profile 提供定时任务：支持仅一次执行或标准六字段 Cron 周期，并可选择准点执行或谷时段执行。
 
 ## 功能特性
 
 - 设置页“定时任务”表单与任务列表，每 5 秒轮询一次。
 - 两种执行方式：**准点执行**和**空闲执行（谷时段）**。
-- 两种重复方式：**仅一次**和**每天执行**。
+- 两种调度类型：**仅一次**和标准六字段 **Cron**；Cron 使用宿主进程本地时区。
 - `when_idle` 仅在北京时间高峰 `09:00-12:00`、`14:00-18:00` 之外执行；高峰期内自动顺延至下一个谷时段。
-- 每天执行保持相同的本地墙钟时间，正确处理跨月和夏令时变化。
+- 可选 Session 标题模板支持全部任务字段和 Moment 风格的日期格式，例如 `Daily Feed · {{scheduledAt:YYYY-MM-DD}}`。
 - 使用 `ctx.storageDomain` 持久化任务状态。
 - 单一串行 Scheduler pump，先持久化 `running` 再启动 Runner。
 - 每次执行使用独立 Session，并继承默认 Agent preset、模型和 Host workspace root。
@@ -77,19 +77,19 @@ dsh plugin --profile web remove dsh-plugin-automations
 | `on_time` 准点执行 | 到期后创建独立 DSH Session 并立即执行。 |
 | `when_idle` 空闲执行 | 仅在北京时间谷时段执行；高峰期到期的任务等待到下一个谷时段。 |
 
-### 重复方式
+### 调度类型
 
-| 重复方式 | 行为 |
+| 调度类型 | 行为 |
 | --- | --- |
 | `once` 仅一次 | 进入终态后不再执行。 |
-| `daily` 每天执行 | 下一自然日相同的本地墙钟时间再次执行。 |
+| `cron` | 每个 occurrence 进入终态后计算下一次匹配时间；失败的 occurrence 不自动重试。 |
 
 ## HTTP API
 
 - `POST /dsh-scheduled-tasks/api/v1/tasks`
   - `Content-Type: application/json`
   - `X-DSH-Scheduled-Tasks: 1`
-  - Body：`{ prompt, scheduledAt, timeZone, mode, repeat }`
+  - Body：`{ prompt, schedule, mode, sessionTitleTemplate? }`
 - `GET /dsh-scheduled-tasks/api/v1/tasks`
 
 ```bash
@@ -98,10 +98,9 @@ curl -X POST http://127.0.0.1:3080/dsh-scheduled-tasks/api/v1/tasks \
   -H 'X-DSH-Scheduled-Tasks: 1' \
   -d '{
     "prompt": "check project tests",
-    "scheduledAt": "2026-08-15T01:00:00+08:00",
-    "timeZone": "Asia/Shanghai",
-    "mode": "when_idle",
-    "repeat": "daily"
+    "schedule": { "type": "cron", "expression": "0 0 8 * * *" },
+    "mode": "on_time",
+    "sessionTitleTemplate": "Daily Feed · {{scheduledAt:YYYY-MM-DD}}"
   }'
 ```
 

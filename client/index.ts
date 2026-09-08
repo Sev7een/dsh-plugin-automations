@@ -18,18 +18,18 @@ export const EXECUTION_MODE_LABELS: Record<string, string> = {
   when_idle: '空闲执行（谷时段）',
 }
 
-export const REPEAT_LABELS: Record<string, string> = {
+export const SCHEDULE_LABELS: Record<string, string> = {
   once: '仅一次',
-  daily: '每天',
+  cron: 'Cron',
 }
 
 interface ClientTask {
   id: string
   prompt: string
+  schedule: { type: 'once' | 'cron'; scheduledAt?: string; expression?: string }
   scheduledAt: string
-  timeZone: string
   mode: string
-  repeat?: string
+  sessionTitleTemplate?: string
   state: string
   startedAt?: string
   finishedAt?: string
@@ -74,10 +74,9 @@ function summary(value: string): string {
   return compact.length > 180 ? `${compact.slice(0, 177)}…` : compact
 }
 
-function localTime(value: string, timeZone: string): string {
+function localTime(value: string): string {
   try {
     return new Intl.DateTimeFormat(undefined, {
-      timeZone,
       year: 'numeric', month: '2-digit', day: '2-digit',
       hour: '2-digit', minute: '2-digit', second: '2-digit',
     }).format(new Date(value))
@@ -90,19 +89,21 @@ function TaskRow({ task }: { task: ClientTask }) {
   let badge = 'dsta-badge'
   if (task.state === 'completed') badge += ' dsta-badge-completed'
   if (task.state === 'failed') badge += ' dsta-badge-failed'
-  const repeat = REPEAT_LABELS[task.repeat ?? 'once'] ?? '仅一次'
+  const schedule = SCHEDULE_LABELS[task.schedule.type] ?? task.schedule.type
+  const scheduleValue = task.schedule.type === 'cron' ? task.schedule.expression : localTime(task.scheduledAt)
   return React.createElement('div', { className: 'dsta-task' },
     React.createElement('div', { className: 'dsta-task-top' },
       React.createElement('div', { className: 'dsta-summary', title: task.prompt }, summary(task.prompt)),
       React.createElement('span', { className: badge }, TASK_STATE_LABELS[task.state] ?? task.state),
     ),
     React.createElement('div', { className: 'dsta-meta' },
-      React.createElement('span', null, `计划：${localTime(task.scheduledAt, task.timeZone)}`),
+      React.createElement('span', null, `计划：${scheduleValue}`),
       React.createElement('span', null, `方式：${EXECUTION_MODE_LABELS[task.mode] ?? task.mode}`),
-      React.createElement('span', null, `重复：${repeat}`),
-      task.startedAt && React.createElement('span', null, `开始：${localTime(task.startedAt, task.timeZone)}`),
-      task.finishedAt && React.createElement('span', null, `完成：${localTime(task.finishedAt, task.timeZone)}`),
+      React.createElement('span', null, `计划类型：${schedule}`),
+      task.startedAt && React.createElement('span', null, `开始：${localTime(task.startedAt)}`),
+      task.finishedAt && React.createElement('span', null, `完成：${localTime(task.finishedAt)}`),
     ),
+    task.sessionTitleTemplate && React.createElement('div', { className: 'dsta-hint' }, `标题模板：${task.sessionTitleTemplate}`),
     task.error && React.createElement('div', { className: 'dsta-failure' },
       `${task.error.code}：${task.error.message}`),
   )
@@ -111,8 +112,10 @@ function TaskRow({ task }: { task: ClientTask }) {
 function Panel() {
   const [prompt, setPrompt] = React.useState('')
   const [scheduledAt, setScheduledAt] = React.useState('')
+  const [scheduleType, setScheduleType] = React.useState<'once' | 'cron'>('once')
+  const [cronExpression, setCronExpression] = React.useState('0 0 8 * * *')
+  const [sessionTitleTemplate, setSessionTitleTemplate] = React.useState('')
   const [mode, setMode] = React.useState<'on_time' | 'when_idle'>('on_time')
-  const [daily, setDaily] = React.useState(false)
   const [tasks, setTasks] = React.useState<ClientTask[]>([])
   const [busy, setBusy] = React.useState(false)
   const [error, setError] = React.useState<string>()
@@ -139,10 +142,14 @@ function Panel() {
     const saved = prompt.trim()
     if (!saved) { setError('请输入任务内容。'); return }
     if (byteLength(saved) > MAX_PROMPT_BYTES) { setError('任务内容不能超过 64 KiB。'); return }
-    if (!scheduledAt) { setError('请选择执行时间。'); return }
-    const instant = new Date(scheduledAt)
-    if (!Number.isFinite(instant.getTime()) || instant.getTime() <= Date.now()) {
-      setError('执行时间必须晚于当前时间。'); return
+    if (scheduleType === 'once') {
+      if (!scheduledAt) { setError('请选择执行时间。'); return }
+      const instant = new Date(scheduledAt)
+      if (!Number.isFinite(instant.getTime()) || instant.getTime() <= Date.now()) {
+        setError('执行时间必须晚于当前时间。'); return
+      }
+    } else if (cronExpression.trim().split(/\s+/).length !== 6) {
+      setError('Cron 表达式必须包含 6 个字段：秒 分 时 日 月 周。'); return
     }
     setBusy(true)
     setError(undefined)
@@ -151,10 +158,11 @@ function Panel() {
       headers: { 'Content-Type': 'application/json', 'X-DSH-Scheduled-Tasks': '1' },
       body: JSON.stringify({
         prompt: saved,
-        scheduledAt: instant.toISOString(),
-        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+        schedule: scheduleType === 'once'
+          ? { type: 'once', scheduledAt: new Date(scheduledAt).toISOString() }
+          : { type: 'cron', expression: cronExpression.trim() },
         mode,
-        repeat: daily ? 'daily' : 'once',
+        ...(sessionTitleTemplate.trim() === '' ? {} : { sessionTitleTemplate: sessionTitleTemplate.trim() }),
       }),
     }).then((response) => {
       return response.json().catch(() => ({})).then((body: { error?: { message?: string } }) => {
@@ -164,8 +172,10 @@ function Panel() {
     }).then(() => {
       setPrompt('')
       setScheduledAt('')
+      setScheduleType('once')
+      setCronExpression('0 0 8 * * *')
+      setSessionTitleTemplate('')
       setMode('on_time')
-      setDaily(false)
       return load()
     }).catch((caught: unknown) => {
       setError(String((caught instanceof Error && caught.message) || caught))
@@ -182,11 +192,33 @@ function Panel() {
           placeholder: '输入需要 DSH Agent 执行的任务',
           onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) => { setPrompt(event.target.value) },
         })),
-      React.createElement('label', { className: 'dsta-label' }, '执行时间',
+      React.createElement('div', { className: 'dsta-label' }, '计划类型',
+        React.createElement('div', { className: 'dsta-modes' },
+          React.createElement('label', { className: 'dsta-mode' },
+            React.createElement('input', { type: 'radio', name: 'dsta-schedule', checked: scheduleType === 'once', onChange: () => { setScheduleType('once') } }), '仅一次'),
+          React.createElement('label', { className: 'dsta-mode' },
+            React.createElement('input', { type: 'radio', name: 'dsta-schedule', checked: scheduleType === 'cron', onChange: () => { setScheduleType('cron') } }), 'Cron'),
+        )),
+      scheduleType === 'once'
+        ? React.createElement('label', { className: 'dsta-label' }, '执行时间',
         React.createElement('input', {
           className: 'dsta-input', type: 'datetime-local', value: scheduledAt, required: true,
           onChange: (event: React.ChangeEvent<HTMLInputElement>) => { setScheduledAt(event.target.value) },
-        })),
+        }))
+        : React.createElement('label', { className: 'dsta-label' }, 'Cron 表达式（本机时区，六字段）',
+          React.createElement('input', {
+            className: 'dsta-input', value: cronExpression, required: true,
+            placeholder: '秒 分 时 日 月 周，例如 0 0 8 * * *',
+            onChange: (event: React.ChangeEvent<HTMLInputElement>) => { setCronExpression(event.target.value) },
+          }),
+          React.createElement('span', { className: 'dsta-hint' }, '支持标准 Cron：秒、分、时、日、月、周；使用本机时区。')),
+      React.createElement('label', { className: 'dsta-label' }, 'Session 标题模板（可选）',
+        React.createElement('input', {
+          className: 'dsta-input', value: sessionTitleTemplate,
+          placeholder: 'Daily Feed · {{scheduledAt:YYYY-MM-DD}}',
+          onChange: (event: React.ChangeEvent<HTMLInputElement>) => { setSessionTitleTemplate(event.target.value) },
+        }),
+        React.createElement('span', { className: 'dsta-hint' }, '使用 {{field}} 或 {{datetimeField:FORMAT}}；支持嵌套字段，例如 {{schedule.expression}}。')),
       React.createElement('div', { className: 'dsta-label' }, '执行方式',
         React.createElement('div', { className: 'dsta-modes' },
           React.createElement('label', { className: 'dsta-mode' },
@@ -202,14 +234,9 @@ function Panel() {
         ),
         mode === 'when_idle' && React.createElement('span', { className: 'dsta-hint' },
           '空闲执行：仅在谷时段执行（北京时间 09:00-12:00、14:00-18:00 高峰之外）。')),
-      React.createElement('label', { className: 'dsta-mode' },
-        React.createElement('input', {
-          type: 'checkbox', checked: daily,
-          onChange: (event: React.ChangeEvent<HTMLInputElement>) => { setDaily(event.target.checked) },
-        }), '每天执行（每天同一时刻重复执行）'),
       React.createElement('div', { className: 'dsta-actions' },
         React.createElement('span', { className: 'dsta-hint' },
-          daily ? '每天在设定时刻重复执行。' : '任务只执行一次。'),
+          scheduleType === 'cron' ? 'Cron 任务会在每个匹配时间执行。' : '任务只执行一次。'),
         React.createElement('button', { className: 'dsta-btn', type: 'submit', disabled: busy },
           busy ? '提交中…' : '提交任务')),
     ),

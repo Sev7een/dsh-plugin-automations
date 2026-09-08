@@ -33,22 +33,36 @@ describe('HTTP composition', () => {
 
     const create = await request(handler, 'POST', {
       prompt: 'check project tests',
-      scheduledAt: new Date(Date.now() + 60_000).toISOString(),
-      timeZone: 'Asia/Shanghai',
+      schedule: { type: 'once', scheduledAt: new Date(Date.now() + 60_000).toISOString() },
       mode: 'on_time',
-      repeat: 'once',
     })
     expect(create.status).toBe(201)
     expect(wakes).toBe(1)
 
     const list = await request(handler, 'GET')
     expect(list.status).toBe(200)
-    expect(list.body).toEqual({
-      tasks: [expect.objectContaining({
+    expect(list.body).toMatchObject({
+      tasks: [{
         prompt: 'check project tests',
         state: 'pending',
-        repeat: 'once',
-      })],
+        schedule: { type: 'once' },
+      }],
     })
+  })
+
+  it('returns the active task for repeated identical creation', async () => {
+    const table = new MemoryTaskTable()
+    const handler = createTaskHttpHandler(table, () => {})
+    const input = {
+      prompt: 'check project tests',
+      schedule: { type: 'cron', expression: '0 0 8 * * *' },
+      mode: 'on_time',
+    }
+    const first = await request(handler, 'POST', input)
+    const second = await request(handler, 'POST', input)
+    expect(first.status).toBe(201)
+    expect(second.status).toBe(200)
+    expect(second.body).toMatchObject({ id: (first.body as { id: string }).id })
+    expect([...table.records]).toHaveLength(1)
   })
 })
